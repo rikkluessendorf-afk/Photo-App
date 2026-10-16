@@ -112,14 +112,22 @@ files = st.file_uploader(
     accept_multiple_files=True,
     key=f"uploader_{ss['uploader_key']}",
 )
+with st.expander("Or take a photo with the in-page camera"):
+    st.caption(
+        "Handy if choosing from your library keeps resetting the page, because it never leaves "
+        "this screen. Quality is lower than your phone's own camera app."
+    )
+    shot = st.camera_input("Camera", key=f"camera_{ss['uploader_key']}", label_visibility="collapsed")
+
+all_files = list(files or []) + ([shot] if shot else [])
 limit = core.max_batch()
-st.caption(f"Up to {limit} new photos per run. Keep this screen open while it works (about 5-10 seconds per photo).")
+st.caption(f"Up to {limit} new photos per run. Keep this screen open while it works.")
 
-go = st.button("Critique my photos", type="primary", disabled=not files)
+go = st.button("Critique my photos", type="primary", disabled=not all_files)
 
-if go and files:
+if go and all_files:
     new, dupes = [], 0
-    for f in files:
+    for f in all_files:
         pid = photo_id(f)
         if pid in ss["results"]:
             dupes += 1
@@ -131,16 +139,24 @@ if go and files:
     problems = []
     if new:
         bar = st.progress(0.0, text="Starting...")
+        note = st.empty()
         for i, (pid, f) in enumerate(new):
-            bar.progress(i / len(new), text=f"Critiquing {f.name} ({i + 1} of {len(new)})")
+            bar.progress(
+                i / len(new),
+                text=f"Critiquing {f.name} ({i + 1} of {len(new)}). Usually 10-40 seconds.",
+            )
+            note.empty()
             try:
-                ss["results"][pid] = core.critique_upload(f.name, f.getvalue())
+                ss["results"][pid] = core.critique_upload(
+                    f.name, f.getvalue(), on_status=lambda m: note.info(m)
+                )
             except core.DailyQuotaError as e:
                 problems.append(str(e))
                 break
             except Exception as e:  # noqa: BLE001
                 problems.append(f"{f.name}: {str(e)[:200]}")
         bar.empty()
+        note.empty()
     if dupes:
         st.info(f"{dupes} photo(s) were already critiqued this session and were skipped.")
     if over:
@@ -163,6 +179,7 @@ if results:
                 "Score": results[k]["composite"],
                 "Tier": results[k]["tier_short"],
                 **{short: results[k]["cats"][key]["score"] for key, _, short, _ in core.CATEGORIES},
+                "Secs": results[k].get("seconds"),
             }
             for k in order
         ]
@@ -195,7 +212,10 @@ if results:
     m1, m2 = st.columns(2)
     m1.metric("Composite", f"{r['composite']:.1f}")
     m2.metric("Tier", r["tier_label"])
-    st.caption(r["photo_type"])
+    meta = f"{r['photo_type']} · {r.get('model', '?')} · {r.get('seconds', '?')}s"
+    if r.get("retries"):
+        meta += f" · {r['retries']} retr{'y' if r['retries'] == 1 else 'ies'}"
+    st.caption(meta)
 
     for key, label, _, weight in core.CATEGORIES:
         c = r["cats"][key]

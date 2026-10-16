@@ -10,6 +10,7 @@ import io
 import json
 import os
 import random
+import re
 import threading
 import time
 from functools import lru_cache
@@ -195,27 +196,108 @@ def throttle():
         _last_call = time.time()
 
 
-def generate_with_retry(**kwargs):
-    delay = 10.0
-    for attempt in range(5):
+MAX_ATTEMPTS = 4
+_thinking_idx = 0  # which thinking setting the model accepted (remembered between calls)
+
+
+def _thinking_variants():
+    """Cap the model's hidden 'thinking' time, which is the biggest cause of slow critiques.
+
+    The critique already writes its evidence before each score, so heavy hidden reasoning adds
+    waiting time without adding much. Different Gemini generations take different knobs, so we try
+    a token budget, then a level, then fall back to the model's default.
+    """
+    budget = cfg("THINKING_BUDGET", 512, int)
+    if budget < 0:
+        return [None]
+    return [
+        types.ThinkingConfig(thinking_budget=budget),
+        types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
+        None,
+    ]
+
+
+def _hinted_delay(msg: str):
+    """Gemini's 429 messages often say how long to wait ('retry in 23s' / retryDelay '23s')."""
+    for pat in (r"retry in\s*(\d+(?:\.\d+)?)\s*s", r"retryDelay\W+(\d+(?:\.\d+)?)\s*s"):
+        m = re.search(pat, msg, re.I)
+        if m:
+            return float(m.group(1))
+    return None
+
+
+def generate_with_retry(on_status=None, stats=None, **kwargs):
+    """Call Gemini with a request timeout, a thinking cap, and polite retries.
+
+    on_status(message) is called when we have to wait, so the UI can say why.
+    stats (a dict) receives {"retries": n}.
+    """
+    global _thinking_idx
+    say = on_status or (lambda m: None)
+    stats = stats if stats is not None else {}
+    stats.setdefault("retries", 0)
+    base = kwargs.pop("config")
+    timeout_s = cfg("REQUEST_TIMEOUT_SECONDS", 90.0, float)
+    attempt = 0
+    timeouts = 0
+    while True:
+        variants = _thinking_variants()
+        idx = min(_thinking_idx, len(variants) - 1)
+        config = base.model_copy(
+            update={
+                "thinking_config": variants[idx],
+                "http_options": types.HttpOptions(timeout=int(timeout_s * 1000)),
+            }
+        )
         throttle()
         try:
-            return get_client().models.generate_content(**kwargs)
+            return get_client().models.generate_content(config=config, **kwargs)
         except Exception as e:  # noqa: BLE001
             msg = str(e)
+            low = msg.lower()
             code = getattr(e, "code", None)
-            if "PerDay" in msg or "per day" in msg.lower():
+
+            if code == 400 and "thinking" in low and idx < len(variants) - 1:
+                _thinking_idx = idx + 1  # this model wants a different thinking setting
+                continue
+            if "limit: 0" in low:
+                raise DailyQuotaError(
+                    "This model has no free-tier quota on your key (limit 0). Set GEMINI_MODEL in "
+                    "Secrets to another Flash model listed under Rate limits in Google AI Studio."
+                ) from e
+            if "PerDay" in msg or "per day" in low:
                 raise DailyQuotaError(
                     "The free daily quota for this model looks used up. It resets daily; "
                     "try again later, or set GEMINI_MODEL to a different Flash model."
                 ) from e
-            retryable = code in (429, 500, 502, 503, 504) or any(
-                t in msg for t in ("RESOURCE_EXHAUSTED", "UNAVAILABLE", "INTERNAL", "DEADLINE")
+
+            is_timeout = any(t in low for t in ("timed out", "timeout", "deadline"))
+            retryable = (
+                is_timeout
+                or code in (429, 500, 502, 503, 504)
+                or any(t in msg for t in ("RESOURCE_EXHAUSTED", "UNAVAILABLE", "INTERNAL"))
             )
-            if not retryable or attempt == 4:
+            if is_timeout:
+                timeouts += 1
+                if timeouts >= 2:
+                    raise RuntimeError(
+                        f"Gemini didn't answer within {int(timeout_s)} seconds, twice. "
+                        "Try again in a minute."
+                    ) from e
+            attempt += 1
+            if not retryable or attempt >= MAX_ATTEMPTS:
                 raise
-            time.sleep(delay + random.uniform(0, 3))
-            delay *= 1.8
+
+            hint = _hinted_delay(msg)
+            wait = min(hint + 1, 65) if hint is not None else min(8 * 2 ** (attempt - 1), 45)
+            wait += random.uniform(0, 2)
+            stats["retries"] += 1
+            why = "rate limit" if code == 429 else "timeout" if is_timeout else "Gemini is overloaded"
+            say(
+                f"Gemini hit a snag ({why}). Waiting {int(wait)}s, then retrying "
+                f"(try {attempt + 1} of {MAX_ATTEMPTS})."
+            )
+            time.sleep(wait)
 
 
 # --------------------------------------------------------------------------
@@ -293,7 +375,10 @@ def critique_text(r: dict) -> str:
     return "\n".join(lines)
 
 
-def evaluate(name: str, jpeg: bytes) -> dict:
+def evaluate(name: str, jpeg: bytes, on_status=None) -> dict:
+    started = time.time()
+    stats = {}
+    model_name = cfg("GEMINI_MODEL", "gemini-flash-latest")
     parts = []
     anchors = load_anchors()
     if anchors:
@@ -318,7 +403,9 @@ def evaluate(name: str, jpeg: bytes) -> dict:
     parts.append(image_part(jpeg))
 
     resp = generate_with_retry(
-        model=cfg("GEMINI_MODEL", "gemini-flash-latest"),
+        on_status=on_status,
+        stats=stats,
+        model=model_name,
         contents=[types.Content(role="user", parts=parts)],
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
@@ -353,12 +440,15 @@ def evaluate(name: str, jpeg: bytes) -> dict:
         "what_doesnt": data.what_doesnt.strip(),
         "repairs": data.repairs.strip(),
         "closing": data.closing.strip(),
+        "model": model_name,
+        "seconds": int(round(time.time() - started)),
+        "retries": stats.get("retries", 0),
     }
 
 
-def critique_upload(name: str, data: bytes) -> dict:
+def critique_upload(name: str, data: bytes, on_status=None) -> dict:
     """Prepare an uploaded photo's bytes and critique it."""
-    return evaluate(name, prepare_image(io.BytesIO(data)))
+    return evaluate(name, prepare_image(io.BytesIO(data)), on_status=on_status)
 
 
 def discussion_reply(r: dict, history: list, message: str) -> str:
